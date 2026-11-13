@@ -1,0 +1,143 @@
+---
+name: update
+
+# 每日检查腾讯官方 Android 配置，发现新版本自动下载发布。
+# Android 官方 downv6 CDN 对境外 IP 可用，无需回退。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 已存在同版本也强制重发
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: 0 22 * * *
+
+permissions: write-all
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.cfg.outputs.tag }}
+      need: ${{ steps.cfg.outputs.need }}
+    steps:
+      - name: 读取官方 Android 配置
+        id: cfg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --connect-timeout 30 \
+            https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/mobileConfig.json -o mb.json
+
+          VER=$(jq -r '.android.version' mb.json)
+          X64=$(jq -r '.android.x64Link' mb.json)
+          # 文件名形如 9.3.85.43200_59f33114080dbd69.apk，取前三段作 tag
+          BASE=$(basename "$X64")
+          TAG=$(echo "$BASE" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)\..*\.apk$/\1/')
+
+          echo "版本: $VER"
+          echo "tag: $TAG"
+          echo "x64: $X64"
+
+          NEED=true
+          if [ "$FORCE" != "true" ]; then
+            if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > /dev/null 2>&1; then
+              NEED=false
+              echo "已存在 $TAG，跳过"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "need=$NEED" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfg
+          path: mb.json
+          retention-days: 1
+
+  build:
+    needs: check
+    if: needs.check.outputs.need == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cfg
+
+      - name: 下载 APK
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          X64=$(jq -r '.android.x64Link' mb.json)
+          X32=$(jq -r '.android.x32Link' mb.json)
+
+          echo "下载 64 位"
+          curl -fsSL --retry 5 --retry-delay 10 --connect-timeout 30 \
+            -o "out/QQ-${TAG}-64bit.apk" "$X64"
+
+          echo "下载 32 位"
+          if curl -fsSL --retry 3 --connect-timeout 30 \
+               -o "out/QQ-${TAG}-32bit.apk" "$X32"; then
+            echo "32 位已获取"
+          else
+            echo "::warning::32 位包未发布，跳过"
+            rm -f "out/QQ-${TAG}-32bit.apk"
+          fi
+
+          ls -lh out
+
+      - name: 生成校验文件并发布
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum QQ-* > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo '## SHA256 Checksums'
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > ../note.md
+          cd ..
+          if ! gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "QQ $TAG" --notes-file note.md
+          fi
+          gh release upload "$TAG" out/* --repo "$REPO" --clobber
+          echo "已发布 $TAG"
+
+  keepalive:
+    if: github.event_name == 'schedule'
+    name: Keepalive
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Re-enable workflow
+        run: |
+          case "${GITHUB_WORKFLOW_REF:?}" in
+          "${GITHUB_REPOSITORY:?}"/.github/workflows/*.y*ml@*) ;;
+          *) false ;;
+          esac
+          workflow="${GITHUB_WORKFLOW_REF%%@*}"
+          workflow="${workflow#${GITHUB_REPOSITORY}/.github/workflows/}"
+          echo "Re-enable $workflow"
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"
