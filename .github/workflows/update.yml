@@ -35,24 +35,49 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 --connect-timeout 30 \
-            https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/mobileConfig.json -o mb.json
+          # CDN 边缘节点缓存不同步，境外 runner 可能拿到旧版本。
+          # 加随机参数绕过缓存，并多取几个源比对，取版本号最大的一份。
+          BEST=""
+          BEST_VER="0"
+          for src in \
+            "https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/mobileConfig.json" \
+            "https://im.qq.com/proxy/domain/qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/mobileConfig.json" \
+            ; do
+            for attempt in 1 2 3; do
+              curl -fsSL --retry 3 --connect-timeout 30 \
+                -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+                "$src?nocache=$(date +%s%N)$attempt" -o cand.json || continue
+              V=$(jq -r '.android.version // "0"' cand.json 2>/dev/null || echo 0)
+              echo "  源 $(echo "$src" | cut -d/ -f3) 第${attempt}次: $V"
+              if [ "$(printf '%s\n%s\n' "$BEST_VER" "$V" | sort -V | tail -1)" = "$V" ] && [ "$V" != "$BEST_VER" ]; then
+                BEST_VER="$V"
+                cp cand.json mb.json
+              fi
+              break
+            done
+          done
+
+          if [ ! -s mb.json ]; then
+            echo "::error::所有源均未取到配置"
+            exit 1
+          fi
 
           VER=$(jq -r '.android.version' mb.json)
           X64=$(jq -r '.android.x64Link' mb.json)
-          # 文件名形如 9.3.85.43200_59f33114080dbd69.apk，取前三段作 tag
           BASE=$(basename "$X64")
           TAG=$(echo "$BASE" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)\..*\.apk$/\1/')
 
-          echo "版本: $VER"
+          echo "采用版本: $VER"
           echo "tag: $TAG"
           echo "x64: $X64"
 
           NEED=true
           if [ "$FORCE" != "true" ]; then
-            if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > /dev/null 2>&1; then
+            HIT=$(gh release list --repo "${{ github.repository }}" --limit 200 \
+              --json tagName --jq "[.[] | select(.tagName | startswith(\"${TAG}\"))] | length")
+            if [ "$HIT" != "0" ]; then
               NEED=false
-              echo "已存在 $TAG，跳过"
+              echo "已存在 $TAG 的发布，跳过"
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
